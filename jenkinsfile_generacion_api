@@ -1,0 +1,278 @@
+// Pipeline: Plan de correccion de deuda tecnica / vulnerabilidades (SOLO LECTURA)
+// -- Version que NO recibe un archivo subido. En vez de eso, llama
+//    directo a la API de Sonar o de Fortify SSC segun el parametro
+//    FUENTE, usando PROYECTO como identificador del proyecto/version.
+//
+// Diferencias contra Jenkinsfile-plan-deuda-tecnica-ec2:
+//   - Se saca el parametro stashedFile 'INSUMO_FILE' y los stages de
+//     "Guardar insumo antes del checkout" / "Restaurar insumo" (ya no hay
+//     archivo que proteger del checkout).
+//   - Se agrega el parametro PROYECTO (y SONAR_URL / FORTIFY_URL).
+//   - El stage de conversion ya no lee un .xlsx/.csv: llama a la API
+//     correspondiente y arma hallazgos.txt directo del JSON. Ya no hace
+//     falta pandas/openpyxl (era solo para leer archivos), asi que el
+//     script es mas simple, con la libreria estandar de Python nomas.
+//   - El resto (LiteLLM, Qwen, filtro por severidad, resumen) es identico.
+//
+// La rama de SONAR esta probada contra la API real que ya usamos en este
+// mismo POC (/api/issues/search). La rama de FORTIFY es un scaffold con la
+// forma tipica de la API de SSC -- NO esta probada contra una instancia
+// real, hay que ajustar nombres de campos y el header de autenticacion
+// cuando tengan Fortify de verdad.
+//
+// Requiere en Jenkins las credenciales: sonarqube-token (Secret text, ya
+// la tenias de antes), fortify-token (Secret text, placeholder -- crearla
+// cuando tengan SSC real), y las de siempre: aws-creds, litellm-proxy-key,
+// github-pat.
+
+pipeline {
+  agent { label 'ec2-internet' }
+
+  parameters {
+    string(name: 'REPO_URL', defaultValue: 'https://github.com/carrasco43/cowork-spaces-frontend.git', description: 'Repo a analizar')
+    string(name: 'REPO_BRANCH', defaultValue: 'develop', description: 'Rama a analizar')
+    choice(name: 'FUENTE', choices: ['SONAR', 'FORTIFY'], description: 'De donde traer los hallazgos')
+    string(name: 'PROYECTO', defaultValue: 'poc_deuda', description: 'Sonar: project key (componentKeys). Fortify: ID de la Application Version en SSC.')
+    string(name: 'SONAR_URL', defaultValue: 'http://sonarqube:9000', description: 'Solo si FUENTE=SONAR. URL base del servidor Sonar alcanzable desde este nodo.')
+    string(name: 'FORTIFY_URL', defaultValue: 'https://tu-ssc.miempresa.com', description: 'Solo si FUENTE=FORTIFY. URL base de Fortify SSC.')
+    choice(name: 'SEVERIDAD_FILTRO', choices: ['TODAS', 'BLOCKER', 'CRITICAL', 'HIGH', 'MAJOR', 'MEDIUM', 'MINOR', 'LOW', 'INFO'], description: 'Solo procesar hallazgos de esta severidad. TODAS = sin filtro')
+    string(name: 'CANTIDAD_MAX', defaultValue: '5', description: 'Maximo de hallazgos a procesar en esta corrida (los mas severos primero). Vacio = sin limite')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        git branch: "${params.REPO_BRANCH}",
+            url: "${params.REPO_URL}",
+            credentialsId: 'github-pat'
+      }
+    }
+
+    stage('Traer hallazgos desde la API') {
+      steps {
+        writeFile file: 'traer_hallazgos.py', text: '''
+import base64
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+
+fuente = os.environ.get("FUENTE", "DESCONOCIDO").upper()
+proyecto = os.environ.get("PROYECTO", "").strip()
+severidad_filtro = (os.environ.get("SEVERIDAD_FILTRO") or "TODAS").strip().upper()
+cantidad_max_raw = (os.environ.get("CANTIDAD_MAX") or "").strip()
+cantidad_max = int(cantidad_max_raw) if cantidad_max_raw.isdigit() else None
+
+RANKING = {
+    "BLOCKER": 0,
+    "CRITICAL": 1,
+    "HIGH": 1,
+    "MAJOR": 2,
+    "MEDIUM": 2,
+    "MINOR": 3,
+    "LOW": 3,
+    "INFO": 4,
+}
+
+
+def traer_de_sonar():
+    sonar_url = os.environ["SONAR_URL"].rstrip("/")
+    token = os.environ["SONAR_TOKEN"]
+    qs = urllib.parse.urlencode({"componentKeys": proyecto, "resolved": "false", "ps": 500})
+    req = urllib.request.Request(f"{sonar_url}/api/issues/search?{qs}")
+    # Sonar usa autenticacion basica con el token como usuario y password vacia.
+    auth = base64.b64encode(f"{token}:".encode()).decode()
+    req.add_header("Authorization", f"Basic {auth}")
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    filas = []
+    for issue in data.get("issues", []):
+        componente = issue.get("component", "")
+        archivo = componente.split(":", 1)[1] if ":" in componente else componente
+        filas.append({
+            "severity": issue.get("severity", ""),
+            "file": archivo,
+            "line": issue.get("line", ""),
+            "message": issue.get("message", ""),
+            "rule": issue.get("rule", ""),
+        })
+    return filas
+
+
+def traer_de_fortify():
+    # NOTA: scaffold sin probar contra un SSC real. La forma general de la
+    # API de Fortify SSC es esta, pero confirmar/ajustar nombres de campos
+    # y el header de autenticacion contra la documentacion de la version
+    # de SSC que tengan instalada.
+    ssc_url = os.environ["FORTIFY_URL"].rstrip("/")
+    token = os.environ["FORTIFY_TOKEN"]
+    qs = urllib.parse.urlencode({
+        "fields": "friority,fullFileName,lineNumber,category,issueName",
+        "limit": 500,
+    })
+    req = urllib.request.Request(f"{ssc_url}/api/v1/projectVersions/{proyecto}/issues?{qs}")
+    req.add_header("Authorization", f"FortifyToken {token}")
+    with urllib.request.urlopen(req) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    filas = []
+    for issue in data.get("data", []):
+        filas.append({
+            "severity": issue.get("friority", ""),
+            "file": issue.get("fullFileName", ""),
+            "line": issue.get("lineNumber", ""),
+            "message": issue.get("issueName") or issue.get("category", ""),
+            "rule": issue.get("category", ""),
+        })
+    return filas
+
+
+try:
+    if fuente == "SONAR":
+        filas = traer_de_sonar()
+    elif fuente == "FORTIFY":
+        filas = traer_de_fortify()
+    else:
+        filas = []
+
+    total_original = len(filas)
+
+    if severidad_filtro != "TODAS":
+        filas = [f for f in filas if str(f.get("severity", "")).strip().upper() == severidad_filtro]
+
+    filas.sort(key=lambda f: RANKING.get(str(f.get("severity", "")).strip().upper(), 99))
+
+    if cantidad_max is not None:
+        filas = filas[:cantidad_max]
+
+    with open("hallazgos.txt", "w", encoding="utf-8") as out:
+        out.write(
+            f"=== Hallazgos de {fuente} - proyecto {proyecto} "
+            f"(severidad={severidad_filtro}, mostrando {len(filas)} de {total_original}) ===\\n"
+        )
+        for f in filas:
+            out.write(
+                f"- [{f.get('severity')}] {f.get('file')}:{f.get('line')} - "
+                f"{f.get('message')} ({f.get('rule')})\\n"
+            )
+
+    print("Listo, hallazgos.txt generado.")
+except Exception as e:
+    with open("hallazgos.txt", "w", encoding="utf-8") as out:
+        out.write(f"=== Error trayendo hallazgos de {fuente}: {e} ===\\n")
+    raise
+'''
+        withCredentials([
+          string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN'),
+          string(credentialsId: 'fortify-token', variable: 'FORTIFY_TOKEN')
+        ]) {
+          sh '''
+            docker run --rm --user root \
+              -v "$(pwd):$(pwd)" \
+              -w "$(pwd)" \
+              -e FUENTE="$FUENTE" \
+              -e PROYECTO="$PROYECTO" \
+              -e SEVERIDAD_FILTRO="$SEVERIDAD_FILTRO" \
+              -e CANTIDAD_MAX="$CANTIDAD_MAX" \
+              -e SONAR_URL="$SONAR_URL" \
+              -e SONAR_TOKEN="$SONAR_TOKEN" \
+              -e FORTIFY_URL="$FORTIFY_URL" \
+              -e FORTIFY_TOKEN="$FORTIFY_TOKEN" \
+              python:3.11-slim \
+              python3 traer_hallazgos.py
+
+            echo "== hallazgos.txt generado =="
+            cat hallazgos.txt
+          '''
+        }
+      }
+    }
+
+    stage('Preparar configuracion de LiteLLM') {
+      steps {
+        writeFile file: 'litellm-config.yaml', text: "model_list:\n  - model_name: qwen-coder\n    litellm_params:\n      model: bedrock/qwen.qwen3-coder-next\n      aws_region_name: us-east-1\n\ngeneral_settings:\n  master_key: os.environ/LITELLM_PROXY_KEY\n"
+      }
+    }
+
+    stage('Arrancar LiteLLM (contenedor efimero)') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY'),
+          string(credentialsId: 'litellm-proxy-key', variable: 'LITELLM_PROXY_KEY')
+        ]) {
+          sh '''
+            docker run -d \
+              --name litellm-proxy-temp \
+              -v "$(pwd):$(pwd)" \
+              --network qwen-net \
+              -e PYTHONUNBUFFERED=1 \
+              -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+              -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+              -e LITELLM_PROXY_KEY=$LITELLM_PROXY_KEY \
+              ghcr.io/berriai/litellm:main-latest \
+              --config "$(pwd)/litellm-config.yaml" --port 4000
+            sleep 20
+
+            echo "== Estado del contenedor litellm-proxy-temp =="
+            docker ps -a --filter name=litellm-proxy-temp
+            echo "== Logs de litellm-proxy-temp =="
+            docker logs litellm-proxy-temp
+          '''
+        }
+      }
+    }
+
+    stage('Generar plan con Qwen (solo lectura)') {
+      steps {
+        withCredentials([string(credentialsId: 'litellm-proxy-key', variable: 'LITELLM_PROXY_KEY')]) {
+          sh '''
+            cat > prompt.txt << 'EOF'
+Te paso hallazgos de analisis estatico (Sonar o Fortify) sobre este repositorio.
+No modifiques ningun archivo. Para cada hallazgo, respondé SOLO con:
+- Si es un problema real: que archivo/linea, y como lo corregirias (descripcion
+  del cambio, no el diff).
+- Si sospechas que es un FALSO POSITIVO: marcalo como "FALSO POSITIVO
+  SOSPECHADO" y explica por que no aplica en este contexto.
+Terminá con un resumen corto: cuantos son correcciones reales y cuantos son
+falsos positivos sospechados.
+Hallazgos:
+EOF
+            cat hallazgos.txt >> prompt.txt
+
+            docker run --rm --user root \
+              -v "$(pwd):$(pwd)" --network qwen-net \
+              -w "$(pwd)" \
+              -e OPENAI_BASE_URL=http://litellm-proxy-temp:4000 \
+              -e OPENAI_API_KEY=$LITELLM_PROXY_KEY \
+              -e OPENAI_MODEL=qwen-coder \
+              node:20 \
+              npx -y @qwen-code/qwen-code \
+                --prompt "$(cat prompt.txt)" \
+                --approval-mode plan \
+              > resumen.txt
+          '''
+        }
+      }
+    }
+
+    stage('Mostrar resumen') {
+      steps {
+        sh '''
+          echo "================ RESUMEN DEL PLAN ================"
+          cat resumen.txt
+          echo "===================================================="
+        '''
+        archiveArtifacts artifacts: 'resumen.txt, hallazgos.txt', fingerprint: true
+      }
+    }
+  }
+
+  post {
+    always {
+      sh 'docker rm -f litellm-proxy-temp || true'
+    }
+  }
+}
