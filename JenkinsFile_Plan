@@ -1,0 +1,226 @@
+// Pipeline: Plan de correccion de deuda tecnica / vulnerabilidades (SOLO LECTURA)
+// -- Version adaptada para correr en el nodo Jenkins que corre en la EC2
+//    con salida a internet y Docker instalado localmente (no dentro de
+//    Docker Compose como en el POC local).
+//
+// Diferencias contra la version local (Jenkinsfile-plan-deuda-tecnica):
+//   1. agent { label 'ec2-internet' } en vez de "agent any" -- fuerza a que
+//      TODO el pipeline corra en ese nodo especifico, el unico con salida
+//      a internet (Bedrock, npm, pip).
+//      *** CAMBIA 'ec2-internet' por el label real que le pusiste al nodo. ***
+//   2. Los "docker run" ya no usan --volumes-from jenkins-poc (ese truco
+//      era porque Jenkins mismo corria dentro de un contenedor sin ruta de
+//      host real). Aca Jenkins corre directo en la EC2, asi que "$(pwd)" YA
+//      es una ruta real del host -- un bind mount normal (-v) alcanza.
+//   3. La red docker "downloads_default" (que salio del nombre de una
+//      carpeta en el POC local) se reemplaza por una red dedicada
+//      "qwen-net", creada una sola vez en la EC2 con:
+//        docker network create qwen-net
+//
+// Resto identico al pipeline local: no hace commit, no hace push, no crea
+// PR. Solo genera un resumen de que se corregiria.
+//
+// Requiere en la EC2: Docker instalado, el usuario SSH del agente Jenkins
+// en el grupo "docker", y la red "qwen-net" ya creada.
+// Requiere en Jenkins: el "File Parameter Plugin", y las credenciales
+// aws-creds, litellm-proxy-key (los nombres pueden variar segun como las
+// hayas creado en esta instancia -- ajustalos si hace falta).
+ 
+pipeline {
+  agent { label 'ec2-internet' }
+ 
+  parameters {
+    string(name: 'REPO_URL', defaultValue: 'https://github.com/carrasco43/cowork-spaces-frontend.git', description: 'Repo a analizar')
+    string(name: 'REPO_BRANCH', defaultValue: 'develop', description: 'Rama a analizar')
+    choice(name: 'FUENTE', choices: ['SONAR', 'FORTIFY'], description: 'De cual herramienta viene el archivo que estas subiendo')
+    choice(name: 'SEVERIDAD_FILTRO', choices: ['TODAS', 'BLOCKER', 'CRITICAL', 'HIGH', 'MAJOR', 'MEDIUM', 'MINOR', 'LOW', 'INFO'], description: 'Solo procesar hallazgos de esta severidad. Sonar usa BLOCKER/CRITICAL/MAJOR/MINOR/INFO, Fortify usa CRITICAL/HIGH/MEDIUM/LOW. TODAS = sin filtro')
+    string(name: 'CANTIDAD_MAX', defaultValue: '5', description: 'Maximo de hallazgos a procesar en esta corrida (los mas severos primero). Vacio = sin limite')
+    stashedFile 'INSUMO_FILE'
+  }
+ 
+  stages {
+ 
+    stage('Guardar insumo antes del checkout') {
+      steps {
+        // Se copia a /tmp ANTES del checkout, porque el checkout puede limpiar
+        // el workspace y borrar el archivo subido como parametro.
+        withFileParameter('INSUMO_FILE') {
+          sh 'cp "$INSUMO_FILE" /tmp/insumo.bin || true'
+        }
+      }
+    }
+ 
+    stage('Checkout') {
+      steps {
+        git branch: "${params.REPO_BRANCH}",
+            url: "${params.REPO_URL}",
+            credentialsId: 'github-pat'
+      }
+    }
+ 
+    stage('Restaurar insumo') {
+      steps {
+        sh 'cp /tmp/insumo.bin insumo.bin 2>/dev/null || true'
+      }
+    }
+ 
+    stage('Convertir insumo (xlsx/csv) a texto plano') {
+      steps {
+        writeFile file: 'convertir_insumo.py', text: '''
+import sys
+import pandas as pd
+ 
+fuente = sys.argv[1] if len(sys.argv) > 1 else "DESCONOCIDO"
+severidad_filtro = sys.argv[2].strip().upper() if len(sys.argv) > 2 and sys.argv[2].strip() else "TODAS"
+cantidad_max_raw = sys.argv[3].strip() if len(sys.argv) > 3 else ""
+cantidad_max = int(cantidad_max_raw) if cantidad_max_raw.isdigit() else None
+ 
+RANKING = {
+    "BLOCKER": 0,
+    "CRITICAL": 1,
+    "HIGH": 1,
+    "MAJOR": 2,
+    "MEDIUM": 2,
+    "MINOR": 3,
+    "LOW": 3,
+    "INFO": 4,
+}
+ 
+def cargar(path):
+    with open(path, "rb") as f:
+        head = f.read(4)
+    if head[:2] == b"PK":
+        return pd.read_excel(path)
+    return pd.read_csv(path)
+ 
+def encontrar_columna_severidad(df):
+    for col in df.columns:
+        if "sever" in str(col).lower():
+            return col
+    return None
+ 
+with open("hallazgos.txt", "w", encoding="utf-8") as out:
+    try:
+        df = cargar("insumo.bin")
+        total_original = len(df)
+        col_sev = encontrar_columna_severidad(df)
+ 
+        if col_sev is None:
+            out.write(f"=== Aviso: no se encontro columna de severidad, no se pudo filtrar/ordenar ===\\n\\n")
+        else:
+            if severidad_filtro != "TODAS":
+                df = df[df[col_sev].astype(str).str.strip().str.upper() == severidad_filtro]
+            df = df.assign(_rank=df[col_sev].astype(str).str.strip().str.upper().map(RANKING).fillna(99))
+            df = df.sort_values("_rank").drop(columns="_rank")
+ 
+        if cantidad_max is not None:
+            df = df.head(cantidad_max)
+ 
+        out.write(f"=== Hallazgos de {fuente} (severidad={severidad_filtro}, mostrando {len(df)} de {total_original} filas) ===\\n")
+        out.write(df.to_string(index=False))
+        out.write("\\n\\n")
+    except FileNotFoundError:
+        out.write("Sin insumo provisto.\\n")
+    except Exception as e:
+        out.write(f"=== No se pudo leer el archivo de {fuente}: {e} ===\\n\\n")
+ 
+print("Conversion completa.")
+'''
+        sh '''
+          docker run --rm --user root \
+            -v "$(pwd):$(pwd)" \
+            -w "$(pwd)" \
+            python:3.11-slim \
+            bash -c "pip install --quiet pandas openpyxl && python3 convertir_insumo.py \\"$FUENTE\\" \\"$SEVERIDAD_FILTRO\\" \\"$CANTIDAD_MAX\\""
+ 
+          echo "== hallazgos.txt generado =="
+          cat hallazgos.txt
+        '''
+      }
+    }
+ 
+    stage('Preparar configuracion de LiteLLM') {
+      steps {
+        writeFile file: 'litellm-config.yaml', text: "model_list:\n  - model_name: qwen-coder\n    litellm_params:\n      model: bedrock/qwen.qwen3-coder-next\n      aws_region_name: us-east-1\n\ngeneral_settings:\n  master_key: os.environ/LITELLM_PROXY_KEY\n"
+      }
+    }
+ 
+    stage('Arrancar LiteLLM (contenedor efimero)') {
+      steps {
+        withCredentials([
+          usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY'),
+          string(credentialsId: 'litellm-proxy-key', variable: 'LITELLM_PROXY_KEY')
+        ]) {
+          sh '''
+            docker run -d \
+              --name litellm-proxy-temp \
+              -v "$(pwd):$(pwd)" \
+              --network qwen-net \
+              -e PYTHONUNBUFFERED=1 \
+              -e AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID \
+              -e AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY \
+              -e LITELLM_PROXY_KEY=$LITELLM_PROXY_KEY \
+              ghcr.io/berriai/litellm:main-latest \
+              --config "$(pwd)/litellm-config.yaml" --port 4000
+            sleep 20
+ 
+            echo "== Estado del contenedor litellm-proxy-temp =="
+            docker ps -a --filter name=litellm-proxy-temp
+            echo "== Logs de litellm-proxy-temp =="
+            docker logs litellm-proxy-temp
+          '''
+        }
+      }
+    }
+ 
+    stage('Generar plan con Qwen (solo lectura)') {
+      steps {
+        withCredentials([string(credentialsId: 'litellm-proxy-key', variable: 'LITELLM_PROXY_KEY')]) {
+          sh '''
+            cat > prompt.txt << 'EOF'
+Te paso hallazgos de analisis estatico (Sonar o Fortify) sobre este repositorio.
+No modifiques ningun archivo. Para cada hallazgo, respondé SOLO con:
+- Si es un problema real: que archivo/linea, y como lo corregirias (descripcion
+  del cambio, no el diff).
+- Si sospechas que es un FALSO POSITIVO: marcalo como "FALSO POSITIVO
+  SOSPECHADO" y explica por que no aplica en este contexto.
+Terminá con un resumen corto: cuantos son correcciones reales y cuantos son
+falsos positivos sospechados.
+Hallazgos:
+EOF
+            cat hallazgos.txt >> prompt.txt
+ 
+            docker run --rm --user root \
+              -v "$(pwd):$(pwd)" --network qwen-net \
+              -w "$(pwd)" \
+              -e OPENAI_BASE_URL=http://litellm-proxy-temp:4000 \
+              -e OPENAI_API_KEY=$LITELLM_PROXY_KEY \
+              -e OPENAI_MODEL=qwen-coder \
+              node:20 \
+              npx -y @qwen-code/qwen-code \
+                --prompt "$(cat prompt.txt)" \
+                --approval-mode plan \
+              > resumen.txt
+          '''
+        }
+      }
+    }
+ 
+    stage('Mostrar resumen') {
+      steps {
+        sh '''
+          echo "================ RESUMEN DEL PLAN ================"
+          cat resumen.txt
+          echo "===================================================="
+        '''
+        archiveArtifacts artifacts: 'resumen.txt, hallazgos.txt', fingerprint: true
+      }
+    }
+  }
+ 
+  post {
+    always {
+      sh 'docker rm -f litellm-proxy-temp || true'
+    }
+  }
+}
